@@ -53,10 +53,10 @@ import static io.netty.util.internal.StringUtil.isSurrogate;
 public final class ByteBufUtil {
 
     private static final InternalLogger logger = InternalLoggerFactory.getInstance(ByteBufUtil.class);
-    private static final FastThreadLocal<CharBuffer> CHAR_BUFFERS = new FastThreadLocal<CharBuffer>() {
+    private static final FastThreadLocal<byte[]> BYTE_ARRAYS = new FastThreadLocal<byte[]>() {
         @Override
-        protected CharBuffer initialValue() throws Exception {
-            return CharBuffer.allocate(1024);
+        protected byte[] initialValue() throws Exception {
+            return PlatformDependent.allocateUninitializedArray(MAX_TL_ARRAY_LEN);
         }
     };
 
@@ -93,6 +93,16 @@ public final class ByteBufUtil {
 
         MAX_CHAR_BUFFER_SIZE = SystemPropertyUtil.getInt("io.netty.maxThreadLocalCharBufferSize", 16 * 1024);
         logger.debug("-Dio.netty.maxThreadLocalCharBufferSize: {}", MAX_CHAR_BUFFER_SIZE);
+    }
+
+    static final int MAX_TL_ARRAY_LEN = 1024;
+
+    /**
+     * Allocates a new array if minLength > {@link ByteBufUtil#MAX_TL_ARRAY_LEN}
+     */
+    static byte[] threadLocalTempArray(int minLength) {
+        return minLength <= MAX_TL_ARRAY_LEN ? BYTE_ARRAYS.get()
+            : PlatformDependent.allocateUninitializedArray(minLength);
     }
 
     /**
@@ -452,8 +462,9 @@ public final class ByteBufUtil {
     }
 
     private static int lastIndexOf(ByteBuf buffer, int fromIndex, int toIndex, byte value) {
-        fromIndex = Math.min(fromIndex, buffer.capacity());
-        if (fromIndex < 0 || buffer.capacity() == 0) {
+        int capacity = buffer.capacity();
+        fromIndex = Math.min(fromIndex, capacity);
+        if (fromIndex < 0 || capacity == 0) {
             return -1;
         }
 
@@ -756,52 +767,27 @@ public final class ByteBufUtil {
         }
     }
 
+    @SuppressWarnings("deprecation")
     static String decodeString(ByteBuf src, int readerIndex, int len, Charset charset) {
         if (len == 0) {
             return StringUtil.EMPTY_STRING;
         }
-        final CharsetDecoder decoder = CharsetUtil.decoder(charset);
-        final int maxLength = (int) ((double) len * decoder.maxCharsPerByte());
-        CharBuffer dst = CHAR_BUFFERS.get();
-        if (dst.length() < maxLength) {
-            dst = CharBuffer.allocate(maxLength);
-            if (maxLength <= MAX_CHAR_BUFFER_SIZE) {
-                CHAR_BUFFERS.set(dst);
-            }
-        } else {
-            dst.clear();
-        }
-        if (src.nioBufferCount() == 1) {
-            decodeString(decoder, src.nioBuffer(readerIndex, len), dst);
-        } else {
-            // We use a heap buffer as CharsetDecoder is most likely able to use a fast-path if src and dst buffers
-            // are both backed by a byte array.
-            ByteBuf buffer = src.alloc().heapBuffer(len);
-            try {
-                buffer.writeBytes(src, readerIndex, len);
-                // Use internalNioBuffer(...) to reduce object creation.
-                decodeString(decoder, buffer.internalNioBuffer(buffer.readerIndex(), len), dst);
-            } finally {
-                // Release the temporary buffer again.
-                buffer.release();
-            }
-        }
-        return dst.flip().toString();
-    }
+        final byte[] array;
+        final int offset;
 
-    private static void decodeString(CharsetDecoder decoder, ByteBuffer src, CharBuffer dst) {
-        try {
-            CoderResult cr = decoder.decode(src, dst, true);
-            if (!cr.isUnderflow()) {
-                cr.throwException();
-            }
-            cr = decoder.flush(dst);
-            if (!cr.isUnderflow()) {
-                cr.throwException();
-            }
-        } catch (CharacterCodingException x) {
-            throw new IllegalStateException(x);
+        if (src.hasArray()) {
+            array = src.array();
+            offset = src.arrayOffset() + readerIndex;
+        } else {
+            array = threadLocalTempArray(len);
+            offset = 0;
+            src.getBytes(readerIndex, array, 0, len);
         }
+        if (CharsetUtil.US_ASCII.equals(charset)) {
+            // Fast-path for US-ASCII which is used frequently.
+            return new String(array, 0, offset, len);
+        }
+        return new String(array, offset, len, charset);
     }
 
     /**
@@ -844,13 +830,14 @@ public final class ByteBufUtil {
      * If {@code copy} is false the underlying storage will be shared, if possible.
      */
     public static byte[] getBytes(ByteBuf buf, int start, int length, boolean copy) {
-        if (isOutOfBounds(start, length, buf.capacity())) {
+        int capacity = buf.capacity();
+        if (isOutOfBounds(start, length, capacity)) {
             throw new IndexOutOfBoundsException("expected: " + "0 <= start(" + start + ") <= start + length(" + length
-                    + ") <= " + "buf.capacity(" + buf.capacity() + ')');
+                    + ") <= " + "buf.capacity(" + capacity + ')');
         }
 
         if (buf.hasArray()) {
-            if (copy || start != 0 || length != buf.capacity()) {
+            if (copy || start != 0 || length != capacity) {
                 int baseOffset = buf.arrayOffset() + start;
                 return Arrays.copyOfRange(buf.array(), baseOffset, baseOffset + length);
             } else {
@@ -858,7 +845,7 @@ public final class ByteBufUtil {
             }
         }
 
-        byte[] v = new byte[length];
+        byte[] v = PlatformDependent.allocateUninitializedArray(length);
         buf.getBytes(start, v);
         return v;
     }
@@ -1413,7 +1400,9 @@ public final class ByteBufUtil {
             int chunkLen = Math.min(length, WRITE_CHUNK_SIZE);
             buffer.clear().position(position);
 
-            if (allocator.isDirectBufferPooled()) {
+            if (length <= MAX_TL_ARRAY_LEN || !allocator.isDirectBufferPooled()) {
+                getBytes(buffer, threadLocalTempArray(chunkLen), 0, chunkLen, out, length);
+            } else {
                 // if direct buffers are pooled chances are good that heap buffers are pooled as well.
                 ByteBuf tmpBuf = allocator.heapBuffer(chunkLen);
                 try {
@@ -1423,8 +1412,6 @@ public final class ByteBufUtil {
                 } finally {
                     tmpBuf.release();
                 }
-            } else {
-                getBytes(buffer, new byte[chunkLen], 0, chunkLen, out, length);
             }
         }
     }
